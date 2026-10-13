@@ -29,6 +29,36 @@ python tsfm_train.py forecast --csv mydata.csv --out forecast.csv
 
 Empty or non-numeric cells are filled with the previous value.
 
+## Testing the model
+
+Training already ends with a test on the newest 15% of the data. To test a saved model again,
+or on new data:
+
+```bash
+python tsfm_train.py evaluate --csv demo.csv           # the training file: scores only the unseen part
+python tsfm_train.py evaluate --csv new_data.csv       # data the model has never seen
+python tsfm_train.py evaluate --csv new_data.csv --last 500 --charts 5
+```
+
+It prints, for the model and for simple baselines:
+
+- **MAE**: average size of a miss, in the data's own units
+- **RMSE**: like MAE, but big misses count more
+- **error %**: total miss as a percentage of the data (compare across datasets)
+- how often the model beats the best baseline, forecast by forecast
+- the error at each step ahead (t+1, t+2, …), and example charts of forecast vs. actual
+
+Make your own test data to check how the model handles new situations:
+
+```bash
+python tsfm_train.py make-data fresh.csv --seed 7               # same pattern, new random noise
+python tsfm_train.py make-data big.csv   --seed 8 --scale 1000  # same pattern, 1000x bigger numbers
+python tsfm_train.py make-data noisy.csv --seed 9 --noise 4     # much noisier
+```
+
+Rules for an honest test: never score on rows used for training, always test on data that comes
+*after* the training data in time, and always compare with the baselines.
+
 ## Options (`train`)
 
 | Option | Default | Meaning |

@@ -19,6 +19,7 @@ How it works
 Quick start
   python tsfm_train.py make-data demo.csv                  # make example data
   python tsfm_train.py train --csv demo.csv --season 24    # train -> model.json
+  python tsfm_train.py evaluate --csv demo.csv             # test the saved model again
   python tsfm_train.py forecast --csv demo.csv             # forecast the next steps
 
 Your own data: any CSV with a header row, e.g.
@@ -33,6 +34,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import random
 import time
 from operator import mul
@@ -47,7 +49,7 @@ VAL_FRACTION = 0.15    # next 15%   -> decide when to stop training
 # 1. Data
 # ---------------------------------------------------------------------------
 
-def make_demo_series(n=3000, seed=0):
+def make_demo_series(n=3000, seed=0, noise=1.5, scale=1.0):
     """Hourly-style data: slow trend + daily cycle (24) + weekly cycle (168) + noise."""
     rng = random.Random(seed)
     series = []
@@ -55,7 +57,7 @@ def make_demo_series(n=3000, seed=0):
         trend = 0.01 * t
         daily = 10 * math.sin(2 * math.pi * t / 24)
         weekly = 5 * math.sin(2 * math.pi * t / 168)
-        series.append(50 + trend + daily + weekly + rng.gauss(0, 1.5))
+        series.append(scale * (50 + trend + daily + weekly + rng.gauss(0, noise)))
     return series
 
 
@@ -238,15 +240,65 @@ def seasonal_naive_forecast(x, horizon, season):
     return [x[len(x) - season + (k % season)] for k in range(horizon)]  # "same as last cycle"
 
 
-def error_metrics(pairs, forecast_fn):
-    """MAE and RMSE in the original units of the data."""
-    abs_sum = sq_sum = count = 0.0
+def score(pairs, forecast_fn, horizon):
+    """Errors of one forecasting method, in the original units of the data."""
+    step_abs, sq_sum, actual_sum, window_mae = [0.0] * horizon, 0.0, 0.0, []
     for x, y in pairs:
-        for p, a in zip(forecast_fn(x), y):
-            abs_sum += abs(p - a)
-            sq_sum += (p - a) ** 2
-            count += 1
-    return abs_sum / count, math.sqrt(sq_sum / count)
+        errors = [p - a for p, a in zip(forecast_fn(x), y)]
+        for k, e in enumerate(errors):
+            step_abs[k] += abs(e)
+        sq_sum += sum(e * e for e in errors)
+        actual_sum += sum(abs(a) for a in y)
+        window_mae.append(sum(abs(e) for e in errors) / horizon)
+    count = len(pairs) * horizon
+    return {
+        "mae": sum(step_abs) / count,                      # average size of a miss
+        "rmse": math.sqrt(sq_sum / count),                 # like MAE, punishes big misses more
+        "wape": 100 * sum(step_abs) / actual_sum if actual_sum else float("nan"),  # miss as % of data
+        "step_mae": [s / len(pairs) for s in step_abs],    # MAE at t+1, t+2, ...
+        "window_mae": window_mae,                          # MAE of every single forecast
+    }
+
+
+def report(pairs, model, season, detail=False, charts=1):
+    """Print how the model compares with simple baselines on (context, target) pairs."""
+    H = model.horizon
+    methods = [("model", model.predict),
+               ("naive (repeat last value)", lambda x: naive_forecast(x, H))]
+    if season:
+        methods.append((f"seasonal naive (season={season})",
+                        lambda x: seasonal_naive_forecast(x, H, season)))
+    scores = {name: score(pairs, fn, H) for name, fn in methods}
+
+    print(f"  {'method':32s} {'MAE':>10s} {'RMSE':>10s} {'error %':>8s}")
+    for name, s in scores.items():
+        print(f"  {name:32s} {s['mae']:10.4f} {s['rmse']:10.4f} {s['wape']:7.1f}%")
+    model_s = scores["model"]
+    best_name = min((n for n in scores if n != "model"), key=lambda n: scores[n]["mae"])
+    best_s = scores[best_name]
+    gain = 100 * (1 - model_s["mae"] / best_s["mae"])
+    print(f"  -> model MAE is {abs(gain):.1f}% {'better' if gain > 0 else 'WORSE'} "
+          "than the best baseline")
+
+    if detail:
+        wins = sum(m < b for m, b in zip(model_s["window_mae"], best_s["window_mae"]))
+        print(f"  -> model beats {best_name.split(' (')[0]} in {wins} of {len(pairs)} "
+              f"forecasts ({100 * wins / len(pairs):.0f}%)")
+        print("\nModel error by how far ahead it forecasts (MAE):")
+        steps = range(H) if H <= 24 else sorted({round(i * (H - 1) / 11) for i in range(12)})
+        top = max(model_s["step_mae"]) or 1.0
+        for k in steps:
+            mae = model_s["step_mae"][k]
+            print(f"  t+{k + 1:<4d} {mae:10.4f}  {'#' * round(40 * mae / top)}")
+
+    # Example charts, spread evenly over the data (newest first).
+    picks = sorted({len(pairs) - 1 - round(j * (len(pairs) - 1) / max(charts - 1, 1))
+                    for j in range(charts)})
+    for i in picks:
+        x, y = pairs[i]
+        print(f"\nForecast {i + 1} of {len(pairs)}:")
+        ascii_chart(x[-60:], model.predict(x), actual=y)
+    return scores
 
 
 def ascii_chart(history, forecast, actual=None, height=14):
@@ -278,7 +330,7 @@ def ascii_chart(history, forecast, actual=None, height=14):
 # ---------------------------------------------------------------------------
 
 def cmd_make_data(args):
-    series = make_demo_series(args.length)
+    series = make_demo_series(args.length, args.seed, args.noise, args.scale)
     with open(args.path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["t", "value"])
@@ -340,26 +392,35 @@ def cmd_train(args):
     model.params = best_params
 
     print("\nTest results (unseen data, original units, lower is better):")
-    candidates = [("model", model.predict),
-                  ("naive (repeat last value)", lambda x: naive_forecast(x, H))]
-    if args.season:
-        candidates.append((f"seasonal naive (season={args.season})",
-                           lambda x: seasonal_naive_forecast(x, H, args.season)))
-    scores = {}
-    for name, fn in candidates:
-        scores[name] = error_metrics(test_pairs, fn)
-        print(f"  {name:32s} MAE {scores[name][0]:10.4f}   RMSE {scores[name][1]:10.4f}")
-    best_baseline = min(v[0] for k, v in scores.items() if k != "model")
-    gain = 100 * (1 - scores["model"][0] / best_baseline)
-    print(f"  -> model MAE is {abs(gain):.1f}% {'better' if gain > 0 else 'WORSE'} "
-          "than the best baseline")
+    scores = report(test_pairs, model, args.season)
 
-    x, y = test_pairs[-1]
-    print("\nLast test window:")
-    ascii_chart(x[-60:], model.predict(x), actual=y)
-
-    model.save(args.out, column=column, test_mae=scores["model"][0])
+    # Remember where the unseen test part starts, so `evaluate` can avoid training rows.
+    model.save(args.out, column=column, season=args.season, trained_on=os.path.abspath(args.csv),
+               test_start=val_end, test_mae=scores["model"]["mae"])
     print(f"\nSaved model to {args.out}")
+
+
+def cmd_evaluate(args):
+    model, info = Model.load(args.model)
+    series, column = read_csv_column(args.csv, args.column or info.get("column"))
+    season = info.get("season", 0) if args.season is None else args.season
+    if season > model.context:
+        raise SystemExit(f"--season must be <= the model's context ({model.context})")
+
+    start = 0
+    if args.last:
+        start = max(0, len(series) - args.last)
+    elif os.path.abspath(args.csv) == info.get("trained_on") and column == info.get("column"):
+        start = info["test_start"]
+        print(f"Note: {args.csv} is the training file, so only rows from {start} on are scored "
+              "(the model never saw them). Testing on training data would look too good.\n")
+    pairs = make_windows(series, model.context, model.horizon, start, len(series))
+    if not pairs:
+        raise SystemExit(f"Not enough data: need at least {model.context + model.horizon} values.")
+
+    print(f"Testing on {len(pairs)} forecasts of '{column}' ({model.horizon} steps each), "
+          "original units, lower is better:")
+    report(pairs, model, season, detail=True, charts=args.charts)
 
 
 def cmd_forecast(args):
@@ -390,6 +451,9 @@ def main():
     p = sub.add_parser("make-data", help="write an example CSV to practise with")
     p.add_argument("path")
     p.add_argument("--length", type=int, default=3000)
+    p.add_argument("--seed", type=int, default=0, help="change it to get new, different noise")
+    p.add_argument("--noise", type=float, default=1.5, help="std of the random noise")
+    p.add_argument("--scale", type=float, default=1.0, help="multiply all values by this")
     p.set_defaults(func=cmd_make_data)
 
     p = sub.add_parser("train", help="train a model on a CSV column")
@@ -407,6 +471,15 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default="model.json")
     p.set_defaults(func=cmd_train)
+
+    p = sub.add_parser("evaluate", help="test a saved model on a CSV and compare with baselines")
+    p.add_argument("--csv", required=True)
+    p.add_argument("--column", help="default: the column the model was trained on")
+    p.add_argument("--model", default="model.json")
+    p.add_argument("--season", type=int, help="seasonal baseline cycle (default: the training one)")
+    p.add_argument("--last", type=int, help="only score the last N rows (default: all unseen rows)")
+    p.add_argument("--charts", type=int, default=3, help="how many example charts to show")
+    p.set_defaults(func=cmd_evaluate)
 
     p = sub.add_parser("forecast", help="forecast the steps after the end of a CSV")
     p.add_argument("--csv", required=True)
