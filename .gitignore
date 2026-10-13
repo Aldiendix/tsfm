@@ -1,0 +1,5 @@
+# Files the script generates (recreate with: python tsfm_train.py make-data / train / forecast)
+model.json
+demo.csv
+forecast.csv
+__pycache__/
